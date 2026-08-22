@@ -2,6 +2,7 @@ package msdfgen
 
 import "core:math"
 import "core:math/linalg"
+import "core:slice"
 
 // A single closed contour of a shape: an ordered, cyclic sequence of edges
 // where each edge's endpoint coincides with the next edge's start point.
@@ -67,6 +68,80 @@ Shape :: struct {
 shape_add_contour :: proc(s: ^Shape) -> ^Contour {
 	append(&s.contours, Contour{})
 	return &s.contours[len(s.contours) - 1]
+}
+
+// Assumes the shape's contours are wound arbitrarily (as with hand-authored
+// SVG paths, which don't guarantee msdfgen's nonzero-fill convention the way
+// TrueType outlines do) and reverses whichever ones are wound backwards, so
+// that filling by the nonzero rule reproduces the even-odd fill pattern of
+// the original contours. Call this (before shape_normalize) for shapes
+// built from build_shape_from_svg_path/load_svg; it's unnecessary for font
+// glyphs, which are already wound consistently.
+orient_contours :: proc(s: ^Shape) {
+	Intersection :: struct {
+		x:             f64,
+		direction:     int,
+		contour_index: int,
+	}
+	ratio := 0.5 * (math.sqrt(f64(5)) - 1) // an irrational number to minimize the chance of an intersection landing on a corner
+
+	n := len(s.contours)
+	orientations := make([]int, n)
+	defer delete(orientations)
+	intersections := make([dynamic]Intersection, 0, 16)
+	defer delete(intersections)
+
+	for i in 0 ..< n {
+		if orientations[i] != 0 || len(s.contours[i].edges) == 0 do continue
+
+		// Find a Y that crosses the contour (usually the first edge suffices;
+		// fall back to sampling within edges in case all endpoints are collinear).
+		y0 := edge_point(s.contours[i].edges[0], 0).y
+		y1 := y0
+		for e in s.contours[i].edges {
+			if y0 != y1 do break
+			y1 = edge_point(e, 1).y
+		}
+		if y0 == y1 {
+			for e in s.contours[i].edges {
+				if y0 != y1 do break
+				y1 = edge_point(e, ratio).y
+			}
+		}
+		y := mix(y0, y1, ratio)
+
+		clear(&intersections)
+		for j in 0 ..< n {
+			for e in s.contours[j].edges {
+				xs, dys, cnt := edge_scanline_intersections(e, y)
+				for k in 0 ..< cnt {
+					append(&intersections, Intersection{xs[k], dys[k], j})
+				}
+			}
+		}
+		if len(intersections) == 0 do continue
+
+		slice.sort_by(intersections[:], proc(a, b: Intersection) -> bool {
+			return a.x < b.x
+		})
+		// Disqualify multiple intersections at the same X.
+		for j in 1 ..< len(intersections) {
+			if intersections[j].x == intersections[j - 1].x {
+				intersections[j].direction = 0
+				intersections[j - 1].direction = 0
+			}
+		}
+		// Inspect the scanline and deduce the orientation of each contour it crosses.
+		for j in 0 ..< len(intersections) {
+			isect := intersections[j]
+			if isect.direction != 0 {
+				orientations[isect.contour_index] += 2 * (int(j % 2 == 1) ~ int(isect.direction > 0)) - 1
+			}
+		}
+	}
+	for i in 0 ..< n {
+		if orientations[i] < 0 do contour_reverse(&s.contours[i])
+	}
 }
 
 // Splits single-edge contours into three so that every contour has enough

@@ -147,6 +147,27 @@ edge_reverse :: proc(e: ^Edge_Segment) {
 	}
 }
 
+// Moves the edge's end point, reshaping curves to keep their tangent at the
+// start point intact. Used only to snap a path's last edge onto its first
+// point when closing an SVG contour that's almost, but not quite, closed.
+edge_move_end_point :: proc(e: ^Edge_Segment, to: Vec2) {
+	switch e.kind {
+	case .Linear:
+		e.p[1] = to
+	case .Quadratic:
+		orig_e_dir := e.p[2] - e.p[1]
+		orig_p1 := e.p[1]
+		e.p[1] += linalg.cross(e.p[2] - e.p[1], to - e.p[2]) / linalg.cross(e.p[2] - e.p[1], e.p[0] - e.p[1]) * (e.p[0] - e.p[1])
+		e.p[2] = to
+		if linalg.dot(orig_e_dir, e.p[2] - e.p[1]) < 0 {
+			e.p[1] = orig_p1
+		}
+	case .Cubic:
+		e.p[2] += to - e.p[3]
+		e.p[3] = to
+	}
+}
+
 // Splits the edge into three consecutive segments that together represent
 // the original edge. Used to make single/double-edge contours colorable.
 edge_split_in_thirds :: proc(e: Edge_Segment) -> (Edge_Segment, Edge_Segment, Edge_Segment) {
@@ -221,6 +242,156 @@ edge_bound :: proc(e: Edge_Segment, min, max: ^Vec2) {
 			if ty[i] > 0 && ty[i] < 1 do point_bounds(edge_point(e, ty[i]), min, max)
 		}
 	}
+}
+
+// The (up to 3) X coordinates and crossing directions (+1 = upward, -1 =
+// downward) where the edge crosses the infinite horizontal line at Y = y.
+// Used only by orient_contours to determine each contour's winding.
+edge_scanline_intersections :: proc(e: Edge_Segment, y: f64) -> (x: [3]f64, dy: [3]int, n: int) {
+	switch e.kind {
+	case .Linear:
+		return linear_scanline_intersections(e.p[0], e.p[1], y)
+	case .Quadratic:
+		return quadratic_scanline_intersections(e.p[0], e.p[1], e.p[2], y)
+	case .Cubic:
+		return cubic_scanline_intersections(e.p[0], e.p[1], e.p[2], e.p[3], y)
+	}
+	return
+}
+
+sign_i :: proc(n: f64) -> int {
+	return int(n > 0) - int(n < 0)
+}
+
+linear_scanline_intersections :: proc(p0, p1: Vec2, y: f64) -> (x: [3]f64, dy: [3]int, n: int) {
+	if (y >= p0.y && y < p1.y) || (y >= p1.y && y < p0.y) {
+		param := (y - p0.y) / (p1.y - p0.y)
+		x[0] = mix(p0.x, p1.x, param)
+		dy[0] = sign_i(p1.y - p0.y)
+		return x, dy, 1
+	}
+	return x, dy, 0
+}
+
+quadratic_scanline_intersections :: proc(p0, p1, p2: Vec2, y: f64) -> (x: [3]f64, dy: [3]int, n: int) {
+	total := 0
+	next_dy := y > p0.y ? 1 : -1
+	x[total] = p0.x
+	if p0.y == y {
+		if p0.y < p1.y || (p0.y == p1.y && p0.y < p2.y) {
+			dy[total] = 1
+			total += 1
+		} else {
+			next_dy = 1
+		}
+	}
+	{
+		ab := p1 - p0
+		br := (p2 - p1) - ab
+		t, solutions := solve_quadratic(br.y, 2 * ab.y, p0.y - y)
+		if solutions >= 2 && t[0] > t[1] {
+			t[0], t[1] = t[1], t[0]
+		}
+		i := 0
+		for i < solutions && total < 2 {
+			if t[i] >= 0 && t[i] <= 1 {
+				x[total] = p0.x + 2 * t[i] * ab.x + t[i] * t[i] * br.x
+				if f64(next_dy) * (ab.y + t[i] * br.y) >= 0 {
+					dy[total] = next_dy
+					total += 1
+					next_dy = -next_dy
+				}
+			}
+			i += 1
+		}
+	}
+	if p2.y == y {
+		if next_dy > 0 && total > 0 {
+			total -= 1
+			next_dy = -1
+		}
+		if (p2.y < p1.y || (p2.y == p1.y && p2.y < p0.y)) && total < 2 {
+			x[total] = p2.x
+			if next_dy < 0 {
+				dy[total] = -1
+				total += 1
+				next_dy = 1
+			}
+		}
+	}
+	if next_dy != (y >= p2.y ? 1 : -1) {
+		if total > 0 {
+			total -= 1
+		} else {
+			if abs(p2.y - y) < abs(p0.y - y) do x[total] = p2.x
+			dy[total] = next_dy
+			total += 1
+		}
+	}
+	return x, dy, total
+}
+
+cubic_scanline_intersections :: proc(p0, p1, p2, p3: Vec2, y: f64) -> (x: [3]f64, dy: [3]int, n: int) {
+	total := 0
+	next_dy := y > p0.y ? 1 : -1
+	x[total] = p0.x
+	if p0.y == y {
+		if p0.y < p1.y || (p0.y == p1.y && (p0.y < p2.y || (p0.y == p2.y && p0.y < p3.y))) {
+			dy[total] = 1
+			total += 1
+		} else {
+			next_dy = 1
+		}
+	}
+	{
+		ab := p1 - p0
+		br := (p2 - p1) - ab
+		a3 := ((p3 - p2) - (p2 - p1)) - br
+		t, solutions := solve_cubic(a3.y, 3 * br.y, 3 * ab.y, p0.y - y)
+		if solutions >= 2 {
+			if t[0] > t[1] do t[0], t[1] = t[1], t[0]
+			if solutions >= 3 && t[1] > t[2] {
+				t[1], t[2] = t[2], t[1]
+				if t[0] > t[1] do t[0], t[1] = t[1], t[0]
+			}
+		}
+		i := 0
+		for i < solutions && total < 3 {
+			if t[i] >= 0 && t[i] <= 1 {
+				x[total] = p0.x + 3 * t[i] * ab.x + 3 * t[i] * t[i] * br.x + t[i] * t[i] * t[i] * a3.x
+				if f64(next_dy) * (ab.y + 2 * t[i] * br.y + t[i] * t[i] * a3.y) >= 0 {
+					dy[total] = next_dy
+					total += 1
+					next_dy = -next_dy
+				}
+			}
+			i += 1
+		}
+	}
+	if p3.y == y {
+		if next_dy > 0 && total > 0 {
+			total -= 1
+			next_dy = -1
+		}
+		if (p3.y < p2.y || (p3.y == p2.y && (p3.y < p1.y || (p3.y == p1.y && p3.y < p0.y)))) && total < 3 {
+			x[total] = p3.x
+			if next_dy < 0 {
+				dy[total] = -1
+				total += 1
+				next_dy = 1
+			}
+		}
+	}
+	if next_dy != (y >= p3.y ? 1 : -1) {
+		if total > 0 {
+			total -= 1
+		} else {
+			if abs(p3.y - y) < abs(p0.y - y) do x[total] = p3.x
+			dy[total] = next_dy
+			total += 1
+		}
+	}
+	return x, dy, total
 }
 
 // Refines a previously computed signed distance into a perpendicular
